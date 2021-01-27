@@ -343,12 +343,14 @@ func (r *RedisClusterReconciler) waitForPodNetworkInterface(pods ...corev1.Pod) 
 	return readyPods, nil
 }
 
+// TODO should wait as long as delete grace period
 func (r *RedisClusterReconciler) waitForPodDelete(pods ...corev1.Pod) error {
 	for _, p := range pods {
 		key, err := client.ObjectKeyFromObject(&p)
 		if err != nil {
 			return err
 		}
+		r.Log.Info(fmt.Sprintf("Waiting for pod delete: %s", p.Name))
 		if pollErr := wait.Poll(genericCheckInterval, genericCheckTimeout, func() (bool, error) {
 			err := r.Get(context.Background(), key, &p)
 			if err != nil {

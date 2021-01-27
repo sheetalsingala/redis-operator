@@ -99,6 +99,9 @@ func NewRedisClusterInfo(rawData string) *RedisClusterInfo {
 	lines := strings.Split(rawData, "\r\n")
 	for _, line := range lines {
 		lineInfo := strings.Split(line, ":")
+		if len(lineInfo) < 2 {
+			return nil
+		}
 		info[lineInfo[0]] = lineInfo[1]
 	}
 	return &info
