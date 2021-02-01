@@ -270,6 +270,7 @@ func (r *RedisClusterReconciler) initializeCluster(redisCluster *dbv1.RedisClust
 
 // Make a new Redis node join the cluster as a follower and wait until data sync is complete
 func (r *RedisClusterReconciler) replicateLeader(followerIP string, leaderIP string) error {
+	r.Log.Info(fmt.Sprintf("replicating leader. leaderIP [%s]. followerIP [%s]", leaderIP, followerIP))
 	leaderID, err := r.RedisCLI.MyClusterID(leaderIP)
 	if err != nil {
 		return err
@@ -279,12 +280,6 @@ func (r *RedisClusterReconciler) replicateLeader(followerIP string, leaderIP str
 	if err != nil {
 		return err
 	}
-
-	// _ = r.RedisCLI.DelFollower(leaderIP, followerID)
-
-	// if _, err := r.RedisCLI.ClusterReset(followerIP); err != nil {
-	// 	return err
-	// }
 
 	if err = r.RedisCLI.AddFollower(followerIP, leaderIP, leaderID); err != nil {
 		return err
@@ -462,29 +457,19 @@ func (r *RedisClusterReconciler) recoverCluster(redisCluster *dbv1.RedisCluster)
 	}
 	for _, leader := range *clusterView {
 		if leader.Failed {
-			fixed := false
 			if leader.Terminating {
 				if err = r.waitForPodDelete(*leader.Pod); err != nil {
 					return errors.Errorf("Failed to wait for leader pod to be deleted %s: %v", leader.NodeNumber, err)
 				}
 			}
-			for _, follower := range leader.Followers {
-				if !follower.Failed {
-					info, err := r.RedisCLI.Info(follower.Pod.Status.PodIP)
-					if err != nil {
-						continue
-					}
-					if info.Replication["role"] == "master" {
-						if err := r.recreateLeader(redisCluster, follower.Pod.Status.PodIP); err != nil {
-							return err
-						}
-						fixed = true
-						break
-					}
-				}
+
+			failoverPodIP, err := r.waitForMasterFailover(redisCluster, leader)
+			if err != nil {
+				return err
 			}
-			if !fixed {
-				return errors.Errorf("[ERROR] *** Could not recover leader %s", leader.NodeNumber)
+
+			if err := r.recreateLeader(redisCluster, failoverPodIP); err != nil {
+				return err
 			}
 		} else {
 			var missingFollowers []NodeNumbers
@@ -496,7 +481,7 @@ func (r *RedisClusterReconciler) recoverCluster(redisCluster *dbv1.RedisCluster)
 					}
 					missingFollowers = append(missingFollowers, NodeNumbers{follower.NodeNumber, follower.LeaderNumber})
 				} else if follower.Failed {
-					if follower.Pod != nil {
+					if follower.Pod != nil || follower.Terminating {
 						failedFollowers = append(failedFollowers, follower.Pod.Status.PodIP)
 					}
 					missingFollowers = append(missingFollowers, NodeNumbers{follower.NodeNumber, follower.LeaderNumber})
@@ -782,4 +767,47 @@ func (r *RedisClusterReconciler) isUnknownNode(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "unknown node")
+}
+
+func (r *RedisClusterReconciler) waitForMasterFailover(redisCluster *dbv1.RedisCluster, leader LeaderNode) (string, error) {
+	r.Log.Info(fmt.Sprintf("waiting for master failover process to finish. old leader node number: %s", leader.NodeNumber))
+	failedFollowers := 0
+	var failoverPodIP string
+
+	for _, follower := range leader.Followers {
+		if follower.Failed || follower.Terminating {
+			failedFollowers++
+		}
+	}
+
+	if failedFollowers == redisCluster.Spec.LeaderFollowersCount {
+		return "", errors.Errorf("failing leader [%] lost all his followers. unable not recover automatically", leader.NodeNumber)
+	}
+
+	wait.PollImmediate(genericCheckInterval, genericCheckTimeout, func() (bool, error) {
+		for _, follower := range leader.Followers {
+			if follower.Failed || follower.Terminating {
+				continue
+			}
+
+			info, err := r.RedisCLI.Info(follower.Pod.Status.PodIP)
+			if err != nil {
+				continue
+			}
+
+			if info.Replication["role"] == "master" {
+				failoverPodIP = follower.Pod.Status.PodIP
+				r.Log.Info(fmt.Sprintf("failover pod ip [%s]", failoverPodIP))
+				return true, nil
+			}
+		}
+
+		return false, nil
+	})
+
+	if len(failoverPodIP) == 0 {
+		return "", errors.Errorf("timeout waiting for master failover")
+	}
+
+	return failoverPodIP, nil
 }
